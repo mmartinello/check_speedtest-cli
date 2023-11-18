@@ -250,12 +250,18 @@ class CheckCommand:
             msg+= " if --no-upload specified!"
             exit_with_error(msg)
 
-        if self.download_warning <= self.download_critical:
+        if (
+            self.download_warning and self.download_critical
+            and (self.download_warning <= self.download_critical)
+        ):
             msg = "Download warning level must be bigger than download"
             msg+= " critical level!"
             exit_with_error(msg)
 
-        if self.upload_warning <= self.upload_critical:
+        if (
+            self.upload_warning and self.upload_critical
+            and (self.upload_warning <= self.upload_critical)
+        ):
             msg = "Upload warning level must be bigger than upload"
             msg+= " critical level!"
             exit_with_error(msg)
