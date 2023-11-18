@@ -311,7 +311,7 @@ class CheckCommand:
         result = subprocess.run(
             command,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL
+            stderr=sys.stdout.buffer
         )
         output = result.stdout.decode('utf-8')
         status = result.returncode
