@@ -311,7 +311,7 @@ class CheckCommand:
         result = subprocess.run(
             command,
             stdout=subprocess.PIPE,
-            stderr=sys.stdout.buffer
+            stderr=subprocess.DEVNULL
         )
         output = result.stdout.decode('utf-8')
         status = result.returncode
@@ -440,7 +440,7 @@ class CheckCommand:
             value,
             str(download_warning) if download_warning else null_value,
             str(download_critical) if download_critical else null_value,
-            str(min_value),
+            str(min_value) if max_upload_speed else null_value,
             str(max_download_speed) if max_download_speed else null_value
         ]
         logging.debug("Download perfdata: {}".format(perfdata_elements))
@@ -458,7 +458,7 @@ class CheckCommand:
             value,
             str(upload_warning) if upload_warning else null_value,
             str(upload_critical) if upload_critical else null_value,
-            str(min_value),
+            str(min_value) if max_upload_speed else null_value,
             str(max_upload_speed) if max_upload_speed else null_value
         ]
         logging.debug("Upload perfdata: {}".format(perfdata_elements))
