@@ -267,24 +267,26 @@ class CheckCommand:
             exit_with_error(msg)
 
         # Check download max level
-        if self.download_max:
+        if self.download_max and self.download_critical:
             if (self.download_max < self.download_critical):
                 msg = "Download max level cannot be lower than download"
                 msg+= " critical level!"
                 exit_with_error(msg)
 
+        if self.download_max and self.download_warning:
             if (self.download_max < self.download_warning):
                 msg = "Download max level cannot be lower than download"
                 msg+= " warning level!"
                 exit_with_error(msg)
 
         # Check upload max level
-        if self.upload_max:
+        if self.upload_max and self.upload_critical:
             if (self.upload_max < self.upload_critical):
                 msg = "Upload max level cannot be lower than upload critical"
                 msg+= " level!"
                 exit_with_error(msg)
 
+        if self.upload_max and self.upload_warning:
             if (self.upload_max < self.upload_warning):
                 msg = "Upload max level cannot be lower than upload warning"
                 msg+= " level!"
