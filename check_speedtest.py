@@ -7,14 +7,16 @@ authors:
     Mattia Martinello - mattia@mattiamartinello.com
 """
 
-_VERSION = '1.0.1'
+_VERSION = '1.1'
 _VERSION_DESCR = 'Nagios/Icinga plugin to monitor WAN connection speed using speedtest-cli'
 
 import argparse
 import json
 import logging
+import os
 import sys
 import subprocess
+import time
 
 ICINGA_OK = 0
 ICINGA_WARNING = 1
@@ -23,16 +25,17 @@ ICINGA_UNKNOWN = 3
 ICINGA_LABELS = {0: 'OK', 1: 'WARNING', 2: 'CRITICAL', 3: 'UNKNOWN'}
 
 SPEEDTEST_CMD = "speedtest-cli"
-SPEEDTEST_TIMEOUT = 120
+SPEEDTEST_TIMEOUT = 90
 
 def icinga_exit(level, details=None, perfdata=None):
     """Exit to system producing an output conform
     to the Icinga standards.
     """
-    # build the message as level + details
+    # build the message as level + details: a pipe in the details would be
+    # parsed as the perfdata delimiter
     msg = ICINGA_LABELS.get(level)
     if details:
-        msg = '{} - {}'.format(msg, details)
+        msg = '{} - {}'.format(msg, str(details).replace('|', '/'))
 
     # add perfata if given
     if perfdata:
@@ -76,9 +79,6 @@ class CheckCommand:
 
         # manage arguments
         self._manage_arguments(args)
-
-        # Main speedtest command
-        self.speedtest_cmd = SPEEDTEST_CMD
 
 
     def add_arguments(self, parser):
@@ -129,6 +129,52 @@ class CheckCommand:
             dest='server',
             type=int,
             help='Specify a server ID to test against.'
+        )
+
+        parser.add_argument(
+            '--source',
+            dest='source',
+            help='Source IP address to bind to (useful on multi-WAN hosts).'
+        )
+
+        parser.add_argument(
+            '--secure',
+            action="store_true",
+            help='Use HTTPS instead of HTTP when communicating with'
+                 ' speedtest.net servers.'
+        )
+
+        parser.add_argument(
+            '--command',
+            dest='speedtest_cmd',
+            default=SPEEDTEST_CMD,
+            help='Speedtest command or path (default: %(default)s).'
+        )
+
+        parser.add_argument(
+            '-t', '--timeout',
+            dest='timeout',
+            type=int,
+            default=SPEEDTEST_TIMEOUT,
+            help='Speedtest command timeout in seconds (default: %(default)s).'
+        )
+
+        parser.add_argument(
+            '-f', '--from-file',
+            dest='from_file',
+            metavar='PATH',
+            help='Read the speedtest-cli JSON output from a file instead of'
+                 ' running the test (example: written by cron). The options'
+                 ' of the speedtest command are ignored.'
+        )
+
+        parser.add_argument(
+            '--max-age',
+            dest='max_age',
+            type=int,
+            metavar='MINUTES',
+            help='With --from-file, exit with UNKNOWN if the file is older'
+                 ' than the given minutes.'
         )
 
         parser.add_argument(
@@ -199,6 +245,24 @@ class CheckCommand:
         # Specify a server ID to test against
         self.server = getattr(args, 'server', None)        
 
+        # Source IP address to bind to
+        self.source = getattr(args, 'source', None)
+
+        # Use HTTPS with speedtest.net servers
+        self.secure = getattr(args, 'secure', False)
+
+        # Speedtest command or path
+        self.speedtest_cmd = getattr(args, 'speedtest_cmd', SPEEDTEST_CMD)
+
+        # Speedtest command timeout in seconds
+        self.timeout = getattr(args, 'timeout', SPEEDTEST_TIMEOUT)
+
+        # Read the speedtest output from a file
+        self.from_file = getattr(args, 'from_file', None)
+
+        # Maximum age in minutes of the speedtest output file
+        self.max_age = getattr(args, 'max_age', None)
+
         # Download warning level in Mbit/s
         self.download_warning = getattr(args, 'download_warning', None)
         if self.download_warning is not None:
@@ -233,6 +297,15 @@ class CheckCommand:
             logging.debug("Upload max: {}".format(self.upload_max))
 
         # Arguments checks
+        if self.max_age is not None and self.from_file is None:
+            exit_with_error("You must specify --from-file to use --max-age!")
+
+        if self.max_age is not None and self.max_age < 0:
+            exit_with_error("Max age must not be negative!")
+
+        if self.timeout <= 0:
+            exit_with_error("Timeout must be bigger than zero!")
+
         if self.no_download and self.no_upload:
             msg = "You must not specify both --no-download and --no-upload:"
             msg+= " nothing to check!"
@@ -325,6 +398,13 @@ class CheckCommand:
             command.append("--server")
             command.append(str(self.server))
 
+        if self.source:
+            command.append("--source")
+            command.append(self.source)
+
+        if self.secure:
+            command.append("--secure")
+
         logging.debug("Composed speedtest command: {}".format(command))
 
         try:
@@ -332,14 +412,16 @@ class CheckCommand:
                 command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=SPEEDTEST_TIMEOUT
+                timeout=self.timeout
             )
         except subprocess.TimeoutExpired:
             msg = "Speedtest command timed out after {} seconds"
-            exit_with_error(msg.format(SPEEDTEST_TIMEOUT))
+            exit_with_error(msg.format(self.timeout))
         except FileNotFoundError:
             msg = "Speedtest command not found: {}"
             exit_with_error(msg.format(self.speedtest_cmd))
+        except OSError as e:
+            exit_with_error("Cannot run speedtest command: {}".format(e))
 
         output = result.stdout.decode('utf-8', errors='replace')
         errors = result.stderr.decode('utf-8', errors='replace')
@@ -359,17 +441,57 @@ class CheckCommand:
         return output
 
 
-    def _get_speed(self, result, key):
-        # Get a speed in bit/s from the result and convert it to Mbit/s
+    def _read_output_file(self):
+        # Get the speedtest output from a file, if not too old
+        try:
+            if self.max_age is not None:
+                age = (time.time() - os.path.getmtime(self.from_file)) / 60
+                logging.debug("Speedtest file age: {} minutes".format(age))
+
+                if age > self.max_age:
+                    msg = "Speedtest file {} is too old: {:.1f} minutes"
+                    msg+= " (max age: {} minutes)"
+                    exit_with_error(
+                        msg.format(self.from_file, age, self.max_age)
+                    )
+
+            with open(self.from_file, 'rb') as output_file:
+                output = output_file.read()
+        except OSError as e:
+            exit_with_error("Cannot read speedtest file: {}".format(e))
+
+        output = output.decode('utf-8', errors='replace')
+        logging.debug("File output: {}".format(output))
+
+        return output
+
+
+    def _get_value(self, result, key, divisor=1):
+        # Get a numeric value from the result, rounded to 2 decimals
         value = result.get(key)
         if value is None:
             return None
 
         try:
-            return round(float(value) / 1000000, 2)
+            return round(float(value) / divisor, 2)
         except (TypeError, ValueError):
-            msg = "Invalid {} speed in speedtest output: {}"
+            msg = "Invalid {} value in speedtest output: {}"
             exit_with_error(msg.format(key, value))
+
+
+    def _get_speed(self, result, key):
+        # Get a speed in bit/s from the result and convert it to Mbit/s
+        return self._get_value(result, key, divisor=1000000)
+
+
+    def _get_server_name(self, result):
+        # Get the "sponsor, name" string of the server, if available
+        server = result.get('server')
+        if not isinstance(server, dict):
+            return None
+
+        names = [server.get('sponsor'), server.get('name')]
+        return ', '.join(str(name) for name in names if name) or None
 
 
     def _parse_output(self, output):
@@ -399,6 +521,13 @@ class CheckCommand:
 
         logging.debug("Upload speed: {}".format(upload_speed))
         self.upload_speed = upload_speed
+
+        # Ping and server are informative only: they can be missing
+        self.ping = self._get_value(result, 'ping')
+        logging.debug("Ping: {}".format(self.ping))
+
+        self.server_name = self._get_server_name(result)
+        logging.debug("Server: {}".format(self.server_name))
 
 
     def _compose_level_string(self, level=0, print_ok=False, prepend="",
@@ -431,7 +560,8 @@ class CheckCommand:
 
     def _compose_output_message(self, download_speed, upload_speed,
                                 download_result_level=0,
-                                upload_result_level=0):
+                                upload_result_level=0,
+                                ping=None, server_name=None):
         # Compose download speed output message
         if download_speed is not None:
             result_string = self._compose_level_string(
@@ -460,6 +590,13 @@ class CheckCommand:
 
         # Compose and return final message
         message = "{}, {}".format(download_speed_msg, upload_speed_msg)
+
+        if ping is not None:
+            message = "{}, Ping: {} ms".format(message, ping)
+
+        if server_name:
+            message = "{} (server: {})".format(message, server_name)
+
         return message
     
 
@@ -467,7 +604,8 @@ class CheckCommand:
                           download_speed=None, download_warning=None,
                           download_critical=None, max_download_speed=None,
                           upload_speed=None, upload_warning=None,
-                          upload_critical=None, max_upload_speed=None
+                          upload_critical=None, max_upload_speed=None,
+                          ping=None
                          ):
         
         min_value = 0.0
@@ -487,6 +625,10 @@ class CheckCommand:
                 "upload_speed", upload_speed, upload_warning,
                 upload_critical, min_value, max_upload_speed
             ))
+
+        # Ping
+        if ping is not None:
+            perfdata.append("'ping'={}ms;;;0".format(ping))
 
         return perfdata
 
@@ -542,7 +684,9 @@ class CheckCommand:
             self.download_speed,
             self.upload_speed,
             download_level,
-            upload_level
+            upload_level,
+            self.ping,
+            self.server_name
         )
 
         # Compose perfdata
@@ -554,7 +698,8 @@ class CheckCommand:
             upload_speed=self.upload_speed,
             upload_warning=self.upload_warning,
             upload_critical=self.upload_critical,
-            max_upload_speed=self.upload_max
+            max_upload_speed=self.upload_max,
+            ping=self.ping
         )
 
         # Exit with level, message and perfdata
@@ -562,12 +707,14 @@ class CheckCommand:
 
 
     def handle(self):
-        """Execute the speedtest command, parse the output and give check
-        result.
+        """Get the speedtest output, parse it and give check result.
         """
 
-        # Build the speedtest command to be executed
-        output = self._compose_speedtest_command()
+        # Read the speedtest output from file or run the speedtest command
+        if self.from_file is not None:
+            output = self._read_output_file()
+        else:
+            output = self._compose_speedtest_command()
 
         # Get download and upload speed
         self._parse_output(output)
