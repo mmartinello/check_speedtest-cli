@@ -7,13 +7,14 @@ authors:
     Mattia Martinello - mattia@mattiamartinello.com
 """
 
-_VERSION = '1.1'
+_VERSION = '1.2'
 _VERSION_DESCR = 'Nagios/Icinga plugin to monitor WAN connection speed using speedtest-cli'
 
 import argparse
 import json
 import logging
 import os
+import shutil
 import sys
 import subprocess
 import time
@@ -25,7 +26,9 @@ ICINGA_UNKNOWN = 3
 ICINGA_LABELS = {0: 'OK', 1: 'WARNING', 2: 'CRITICAL', 3: 'UNKNOWN'}
 
 SPEEDTEST_CMD = "speedtest-cli"
+OOKLA_CMD = "speedtest"
 SPEEDTEST_TIMEOUT = 90
+VERSION_TIMEOUT = 10
 
 def icinga_exit(level, details=None, perfdata=None):
     """Exit to system producing an output conform
@@ -147,8 +150,27 @@ class CheckCommand:
         parser.add_argument(
             '--command',
             dest='speedtest_cmd',
-            default=SPEEDTEST_CMD,
-            help='Speedtest command or path (default: %(default)s).'
+            help='Speedtest command or path (default: {} with --python, {}'
+                 ' with --ookla). Without --ookla the speedtest-cli syntax is'
+                 ' used.'.format(SPEEDTEST_CMD, OOKLA_CMD)
+        )
+
+        # Speedtest flavour: if not specified it is detected, preferring the
+        # Ookla speedtest command
+        flavour = parser.add_mutually_exclusive_group()
+
+        flavour.add_argument(
+            '--python',
+            action="store_true",
+            help='Use the Python speedtest-cli command.'
+        )
+
+        flavour.add_argument(
+            '--ookla',
+            action="store_true",
+            help='Use the Ookla speedtest command instead of speedtest-cli,'
+                 ' accepting its license and GDPR terms. It does not support'
+                 ' --no-download, --no-upload and --secure.'
         )
 
         parser.add_argument(
@@ -163,9 +185,9 @@ class CheckCommand:
             '-f', '--from-file',
             dest='from_file',
             metavar='PATH',
-            help='Read the speedtest-cli JSON output from a file instead of'
-                 ' running the test (example: written by cron). The options'
-                 ' of the speedtest command are ignored.'
+            help='Read the speedtest-cli or Ookla speedtest JSON output from'
+                 ' a file instead of running the test (example: written by'
+                 ' cron). The options of the speedtest command are ignored.'
         )
 
         parser.add_argument(
@@ -251,8 +273,23 @@ class CheckCommand:
         # Use HTTPS with speedtest.net servers
         self.secure = getattr(args, 'secure', False)
 
+        # Use the Ookla speedtest command
+        self.ookla = getattr(args, 'ookla', False)
+
+        # Use the Python speedtest-cli command
+        self.python = getattr(args, 'python', False)
+
         # Speedtest command or path
-        self.speedtest_cmd = getattr(args, 'speedtest_cmd', SPEEDTEST_CMD)
+        self.speedtest_cmd = getattr(args, 'speedtest_cmd', None)
+
+        # Detect the speedtest command if nothing specified
+        self.detect_command = not (
+            self.ookla or self.python or self.speedtest_cmd
+        )
+        self.detected_command = None
+
+        if not self.speedtest_cmd:
+            self.speedtest_cmd = OOKLA_CMD if self.ookla else SPEEDTEST_CMD
 
         # Speedtest command timeout in seconds
         self.timeout = getattr(args, 'timeout', SPEEDTEST_TIMEOUT)
@@ -305,6 +342,9 @@ class CheckCommand:
 
         if self.timeout <= 0:
             exit_with_error("Timeout must be bigger than zero!")
+
+        if self.ookla and self.from_file is None:
+            self._check_ookla_options()
 
         if self.no_download and self.no_upload:
             msg = "You must not specify both --no-download and --no-upload:"
@@ -383,8 +423,91 @@ class CheckCommand:
                 exit_with_error(msg)
 
 
-    def _compose_speedtest_command(self):
-        # Main speedtest command
+    def _needs_python(self):
+        # These options are not supported by the Ookla speedtest command
+        return self.no_download or self.no_upload or self.secure
+
+
+    def _check_ookla_options(self):
+        if self._needs_python():
+            msg = "--no-download, --no-upload and --secure are not supported"
+            msg+= " by the Ookla speedtest command!"
+            exit_with_error(msg)
+
+
+    def _is_python_speedtest(self, command):
+        # The speedtest-cli package installs a "speedtest" command too
+        try:
+            result = subprocess.run(
+                [ command, "--version" ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=VERSION_TIMEOUT
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            logging.debug("Cannot get speedtest version: {}".format(e))
+            return False
+
+        output = result.stdout.decode('utf-8', errors='replace')
+        logging.debug("Speedtest version: {}".format(output))
+
+        return output.startswith(SPEEDTEST_CMD)
+
+
+    def _detect_speedtest_command(self):
+        python_cmd = SPEEDTEST_CMD if shutil.which(SPEEDTEST_CMD) else None
+
+        use_ookla = False
+        ookla_path = shutil.which(OOKLA_CMD)
+        if ookla_path:
+            if self._is_python_speedtest(ookla_path):
+                python_cmd = python_cmd or OOKLA_CMD
+            else:
+                use_ookla = True
+
+        # Prefer Ookla, unless the options need a Python command available
+        if use_ookla and python_cmd and self._needs_python():
+            use_ookla = False
+
+        if use_ookla:
+            self._check_ookla_options()
+            self.ookla = True
+            self.speedtest_cmd = OOKLA_CMD
+        elif python_cmd:
+            self.speedtest_cmd = python_cmd
+        else:
+            msg = "Speedtest command not found: {} or {}"
+            exit_with_error(msg.format(OOKLA_CMD, SPEEDTEST_CMD))
+
+        self.detected_command = "{}, {}".format(
+            self.speedtest_cmd,
+            "Ookla" if self.ookla else "Python"
+        )
+        logging.debug("Detected command: {}".format(self.detected_command))
+
+
+    def _compose_ookla_command(self):
+        # Main Ookla speedtest command: it would ask to accept license and
+        # GDPR terms otherwise
+        command = [
+            self.speedtest_cmd,
+            "--format=json",
+            "--accept-license",
+            "--accept-gdpr"
+        ]
+
+        # Build command arguments
+        if self.server:
+            command.append("--server-id={}".format(self.server))
+
+        if self.source:
+            command.append("--ip={}".format(self.source))
+
+        return command
+
+
+    def _compose_cli_command(self):
+        # Main speedtest-cli command
         command = [ self.speedtest_cmd, "--json" ]
 
         # Build command arguments
@@ -405,6 +528,18 @@ class CheckCommand:
         if self.secure:
             command.append("--secure")
 
+        return command
+
+
+    def _compose_speedtest_command(self):
+        if self.detect_command:
+            self._detect_speedtest_command()
+
+        if self.ookla:
+            command = self._compose_ookla_command()
+        else:
+            command = self._compose_cli_command()
+
         logging.debug("Composed speedtest command: {}".format(command))
 
         try:
@@ -415,8 +550,8 @@ class CheckCommand:
                 timeout=self.timeout
             )
         except subprocess.TimeoutExpired:
-            msg = "Speedtest command timed out after {} seconds"
-            exit_with_error(msg.format(self.timeout))
+            msg = "Speedtest command {} timed out after {} seconds"
+            exit_with_error(msg.format(self.speedtest_cmd, self.timeout))
         except FileNotFoundError:
             msg = "Speedtest command not found: {}"
             exit_with_error(msg.format(self.speedtest_cmd))
@@ -432,7 +567,8 @@ class CheckCommand:
         logging.debug("Command errors: {}".format(errors))
 
         if status != 0:
-            msg = "Speedtest command exited with status {}".format(status)
+            msg = "Speedtest command {} exited with status {}"
+            msg = msg.format(self.speedtest_cmd, status)
             lines = errors.strip().splitlines()
             if lines:
                 msg = "{}: {}".format(msg, lines[-1])
@@ -480,17 +616,34 @@ class CheckCommand:
 
 
     def _get_speed(self, result, key):
-        # Get a speed in bit/s from the result and convert it to Mbit/s
+        # Ookla speedtest: get the bandwidth in byte/s and convert it to Mbit/s
+        if isinstance(result.get(key), dict):
+            return self._get_value(result[key], 'bandwidth', divisor=125000)
+
+        # speedtest-cli: get a speed in bit/s and convert it to Mbit/s
         return self._get_value(result, key, divisor=1000000)
 
 
+    def _get_ping(self, result):
+        # Ookla speedtest gives ping details, speedtest-cli only the latency
+        if isinstance(result.get('ping'), dict):
+            return self._get_value(result['ping'], 'latency')
+
+        return self._get_value(result, 'ping')
+
+
     def _get_server_name(self, result):
-        # Get the "sponsor, name" string of the server, if available
+        # Get the "sponsor, name" string of the server, if available: Ookla
+        # speedtest gives the sponsor as name and the city as location
         server = result.get('server')
         if not isinstance(server, dict):
             return None
 
-        names = [server.get('sponsor'), server.get('name')]
+        names = [
+            server.get('sponsor'),
+            server.get('name'),
+            server.get('location')
+        ]
         return ', '.join(str(name) for name in names if name) or None
 
 
@@ -523,7 +676,7 @@ class CheckCommand:
         self.upload_speed = upload_speed
 
         # Ping and server are informative only: they can be missing
-        self.ping = self._get_value(result, 'ping')
+        self.ping = self._get_ping(result)
         logging.debug("Ping: {}".format(self.ping))
 
         self.server_name = self._get_server_name(result)
@@ -561,7 +714,8 @@ class CheckCommand:
     def _compose_output_message(self, download_speed, upload_speed,
                                 download_result_level=0,
                                 upload_result_level=0,
-                                ping=None, server_name=None):
+                                ping=None, server_name=None,
+                                command=None):
         # Compose download speed output message
         if download_speed is not None:
             result_string = self._compose_level_string(
@@ -596,6 +750,9 @@ class CheckCommand:
 
         if server_name:
             message = "{} (server: {})".format(message, server_name)
+
+        if command:
+            message = "{} (command: {})".format(message, command)
 
         return message
     
@@ -686,7 +843,8 @@ class CheckCommand:
             download_level,
             upload_level,
             self.ping,
-            self.server_name
+            self.server_name,
+            self.detected_command
         )
 
         # Compose perfdata
